@@ -1,8 +1,9 @@
 use std::{env, sync::Arc};
 
 use git_testament::{git_testament, render_testament};
-use graph::prometheus::Registry;
+use graph::{data::graphql::effort::LoadManager, prometheus::Registry};
 use graph_core::MetricsRegistry;
+use graph_graphql::prelude::GraphQlRunner;
 use lazy_static::lazy_static;
 use structopt::StructOpt;
 
@@ -10,9 +11,9 @@ use graph::{
     log::logger,
     prelude::{info, o, slog, tokio, Logger, NodeId},
 };
-use graph_node::config;
 use graph_node::store_builder::StoreBuilder;
-use graph_store_postgres::{connection_pool::ConnectionPool, SubgraphStore, PRIMARY_SHARD};
+use graph_node::{config, manager::PanicSubscriptionManager};
+use graph_store_postgres::{connection_pool::ConnectionPool, Store, SubgraphStore, PRIMARY_SHARD};
 
 use crate::config::Config as Cfg;
 use graph_node::manager::commands;
@@ -106,6 +107,17 @@ pub enum Command {
     /// Print information about a configuration file without
     /// actually connecting to databases or network clients
     Config(ConfigCommand),
+    /// Run a GraphQL query
+    Query {
+        /// The subgraph to query
+        ///
+        /// Either a deployment id `Qm..` or a subgraph name
+        target: String,
+        /// The GraphQL query
+        query: String,
+        /// The variables in the form `key=value`
+        vars: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, StructOpt)]
@@ -187,6 +199,25 @@ fn make_main_pool(logger: &Logger, node_id: &NodeId, config: &Cfg) -> Connection
 
 fn make_store(logger: &Logger, node_id: &NodeId, config: &Cfg) -> Arc<SubgraphStore> {
     StoreBuilder::make_sharded_store(logger, node_id, config, make_registry(logger))
+}
+
+fn make_runner(
+    logger: &Logger,
+    node_id: &NodeId,
+    config: &Cfg,
+) -> Arc<GraphQlRunner<Store, PanicSubscriptionManager>> {
+    let registry = make_registry(logger);
+    let network_store =
+        StoreBuilder::new(logger, node_id, config, registry.clone()).network_store(vec![]);
+    let subscription_manager = Arc::new(PanicSubscriptionManager);
+    let load_manager = Arc::new(LoadManager::new(&logger, vec![], registry.clone(), 128));
+
+    Arc::new(GraphQlRunner::new(
+        &logger,
+        network_store.clone(),
+        subscription_manager.clone(),
+        load_manager,
+    ))
 }
 
 #[tokio::main]
@@ -273,6 +304,14 @@ async fn main() {
         Reassign { id, node } => {
             let store = make_store();
             commands::assign::reassign(store, id, node)
+        }
+        Query {
+            target,
+            query,
+            vars,
+        } => {
+            let runner = make_runner(&logger, &node, &config);
+            commands::query::run(runner, target, query, vars).await
         }
     };
     if let Err(e) = result {
