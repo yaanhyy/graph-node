@@ -34,7 +34,7 @@ use graph_server_json_rpc::JsonRpcServer;
 use graph_server_metrics::PrometheusMetricsServer;
 use graph_server_websocket::SubscriptionServer as GraphQLSubscriptionServer;
 use graph_store_postgres::BlockStore as DieselBlockStore;
-
+use ipfs_api::TryFromUri;
 mod config;
 mod opt;
 mod store_builder;
@@ -561,8 +561,8 @@ fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<Ipf
                 "Trying IPFS node at: {}",
                 SafeDisplay(&ipfs_address)
             );
-
-            let ipfs_client = match IpfsClient::new_from_uri(&ipfs_address) {
+            println!("ipfs_address:{:?}", ipfs_address);
+            let ipfs_client = match IpfsClient::from_str(&ipfs_address) {
                 Ok(ipfs_client) => ipfs_client,
                 Err(e) => {
                     error!(
