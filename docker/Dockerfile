@@ -52,6 +52,16 @@ ENV node_id "default"
 # The ethereum network polling interval  (in milliseconds)
 ENV ethereum_polling_interval ""
 
+# The location of an optional configuration file for graph-node, as
+# described in ../docs/sharding.md
+# Using a configuration file is experimental, and the file format may
+# change in backwards-incompatible ways
+ENV GRAPH_NODE_CONFIG ""
+
+# Disable core dumps; this is useful for query nodes with large caches. Set
+# this to anything to disable coredumps (via 'ulimit -c 0')
+ENV disable_core_dumps ""
+
 # HTTP port
 EXPOSE 8000
 # WebSocket port

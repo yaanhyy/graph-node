@@ -22,7 +22,7 @@ reqwest = "0.10"
 # tuple support which isn't upstreamed yet. For now, we shall deviate from
 # ethabi, but long term we want to find a way to drop our fork.
 ethabi = { git = "https://github.com/graphprotocol/ethabi.git", branch = "master" }
-hex = "0.4.2"
+hex = "0.4.3"
 http = "0.2"
 futures = "0.1.21"
 graphql-parser = "0.3"
@@ -49,7 +49,7 @@ tiny-keccak = "1.5.0"
 tokio = { version = "0.2.22", features = ["stream", "rt-threaded", "rt-util", "blocking", "time", "sync", "macros", "test-util"] }
 tokio-retry = { git = "https://github.com/graphprotocol/rust-tokio-retry", branch = "update-to-tokio-02" }
 url = "2.2.1"
-prometheus = "0.11.0"
+prometheus = "0.12.0"
 priority-queue = "0.7.0"
 futures03 = { version = "0.3.1", package = "futures", features = ["compat"] }
 uuid = { version = "0.8.1", features = ["v4"] }
