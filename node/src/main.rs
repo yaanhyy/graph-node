@@ -562,7 +562,7 @@ fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<Ipf
                 SafeDisplay(&ipfs_address)
             );
 
-            let ipfs_client = match IpfsClient::new_from_uri(&ipfs_address) {
+            let ipfs_client = match IpfsClient::from_str(&ipfs_address) {
                 Ok(ipfs_client) => ipfs_client,
                 Err(e) => {
                     error!(
