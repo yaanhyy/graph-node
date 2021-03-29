@@ -323,8 +323,10 @@ impl WasmInstance {
     ) -> Result<WasmInstance, anyhow::Error> {
         let mut linker = wasmtime::Linker::new(&wasmtime::Store::new(valid_module.module.engine()));
 
-        // Used by exports to access the instance context. It is `None` while the module is not yet
-        // instantiated. A desirable consequence is that start function cannot access host exports.
+        // Used by exports to access the instance context. There are two ways this can be set:
+        // - After instantiation, if no host export is called in the start function.
+        // - During the start function, if it calls a host export.
+        // Either way, after instantiation this will have been set.
         let shared_ctx: Rc<RefCell<Option<WasmInstanceContext>>> = Rc::new(RefCell::new(None));
 
         // We will move the ctx only once, to init `shared_ctx`. But we don't statically know where
@@ -437,6 +439,11 @@ impl WasmInstance {
 
                     // Happens when calling a host fn in Wasm start.
                     if instance.is_none() {
+                        error!(
+                            ctx.borrow().as_ref().unwrap().logger,
+                            "contract calls in globals are deprecated"
+                        );
+
                         *instance = Some(
                             WasmInstanceContext::from_caller(
                                 caller,
@@ -710,8 +717,6 @@ impl WasmInstanceContext {
             .and_then(|e| e.into_memory())
             .context("Failed to find memory export in the WASM module")?;
 
-        // This is where we require our patch wasmtime.
-        // See also: 3a23f045-eb9d-4b12-8c7c-3a4c2e34bea1
         let memory_allocate = caller
             .get_export("memory.allocate")
             .and_then(|e| e.into_func())
@@ -775,9 +780,13 @@ impl WasmInstanceContext {
         id_ptr: AscPtr<AscString>,
         data_ptr: AscPtr<AscEntity>,
     ) -> Result<(), HostExportError> {
+        let stopwatch = &self.host_metrics.stopwatch;
+        stopwatch.start_section("host_export_store_set__wasm_instance_context_store_set");
+
         let entity = self.asc_get(entity_ptr)?;
         let id = self.asc_get(id_ptr)?;
         let data = self.try_asc_get(data_ptr)?;
+
         self.ctx.host_exports.store_set(
             &self.ctx.logger,
             &mut self.ctx.state,
@@ -785,6 +794,7 @@ impl WasmInstanceContext {
             entity,
             id,
             data,
+            stopwatch,
         )?;
         Ok(())
     }

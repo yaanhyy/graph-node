@@ -1,21 +1,21 @@
 //! Test relational schemas that use `Bytes` to store ids
 use diesel::connection::SimpleConnection as _;
 use diesel::pg::PgConnection;
-use hex_literal::hex;
-use lazy_static::lazy_static;
-use std::collections::BTreeMap;
-
 use graph::prelude::{
-    web3::types::H256, ChildMultiplicity, Entity, EntityCollection, EntityKey, EntityLink,
-    EntityOrder, EntityRange, EntityWindow, ParentLink, Schema, SubgraphDeploymentId, Value,
-    WindowAttribute, BLOCK_NUMBER_MAX,
+    o, slog, web3::types::H256, ChildMultiplicity, Entity, EntityCollection, EntityKey, EntityLink,
+    EntityOrder, EntityRange, EntityWindow, Logger, ParentLink, Schema, StopwatchMetrics,
+    SubgraphDeploymentId, Value, WindowAttribute, BLOCK_NUMBER_MAX,
 };
 use graph::{
     components::store::EntityType,
     data::store::scalar::{BigDecimal, BigInt},
 };
+use graph_mock::MockMetricsRegistry;
 use graph_store_postgres::layout_for_tests::{Layout, Namespace};
-
+use hex_literal::hex;
+use lazy_static::lazy_static;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use test_store::*;
 
 const THINGS_GQL: &str = "
@@ -65,6 +65,11 @@ lazy_static! {
     };
     static ref NAMESPACE: Namespace = Namespace::new("sgd0815".to_string()).unwrap();
     static ref THING: EntityType = EntityType::from("Thing");
+    static ref MOCK_STOPWATCH: StopwatchMetrics = StopwatchMetrics::new(
+        Logger::root(slog::Discard, o!()),
+        THINGS_SUBGRAPH_ID.clone(),
+        Arc::new(MockMetricsRegistry::new()),
+    );
 }
 
 /// Removes test data from the database behind the store.
@@ -80,8 +85,13 @@ fn insert_entity(conn: &PgConnection, layout: &Layout, entity_type: &str, entity
         entity_type.to_owned(),
         entity.id().unwrap(),
     );
+
+    let entity_type = EntityType::from(entity_type);
+    let mut entities = vec![(key.clone(), entity)];
     let errmsg = format!("Failed to insert entity {}[{}]", entity_type, key.entity_id);
-    layout.insert(&conn, &key, entity, 0).expect(&errmsg);
+    layout
+        .insert(&conn, &entity_type, &mut entities, 0, &MOCK_STOPWATCH)
+        .expect(&errmsg);
 }
 
 fn insert_thing(conn: &PgConnection, layout: &Layout, id: &str, name: &str) {
@@ -263,14 +273,20 @@ fn update() {
             "Thing".to_owned(),
             entity.id().unwrap().clone(),
         );
+
+        let entity_id = entity.id().unwrap().clone();
+        let entity_type = key.entity_type.clone();
+        let entities = vec![(key, entity)];
         layout
-            .update(&conn, &key, entity.clone(), 1)
+            .update(&conn, entity_type, entities.clone(), 1, &MOCK_STOPWATCH)
             .expect("Failed to update");
 
         let actual = layout
-            .find(conn, &*THING, &entity.id().unwrap(), BLOCK_NUMBER_MAX)
+            .find(conn, &*THING, &entity_id, BLOCK_NUMBER_MAX)
             .expect("Failed to read Thing[deadbeef]")
             .unwrap();
+
+        let entity = &entities.first().unwrap().1;
         assert_entity_eq!(scrub(&entity), actual);
     });
 }
@@ -286,17 +302,26 @@ fn delete() {
         insert_entity(&conn, &layout, "Thing", two);
 
         // Delete where nothing is getting deleted
-        let mut key = EntityKey::data(
+        let key = EntityKey::data(
             THINGS_SUBGRAPH_ID.clone(),
             "Thing".to_owned(),
             "ffff".to_owned(),
         );
-        let count = layout.delete(&conn, &key, 1).expect("Failed to delete");
+        let entity_type = key.entity_type.clone();
+        let mut entity_keys = vec![key.entity_id.clone()];
+        let count = layout
+            .delete(&conn, &entity_type, &entity_keys, 1, &MOCK_STOPWATCH)
+            .expect("Failed to delete");
         assert_eq!(0, count);
 
         // Delete entity two
-        key.entity_id = TWO_ID.to_owned();
-        let count = layout.delete(&conn, &key, 1).expect("Failed to delete");
+        entity_keys
+            .get_mut(0)
+            .map(|key| *key = TWO_ID.to_owned())
+            .expect("Failed to update entity types");
+        let count = layout
+            .delete(&conn, &entity_type, &entity_keys, 1, &MOCK_STOPWATCH)
+            .expect("Failed to delete");
         assert_eq!(1, count);
     });
 }

@@ -12,7 +12,7 @@ use diesel::result::{Error as DieselError, QueryResult};
 use diesel::sql_types::{Array, Binary, Bool, Integer, Jsonb, Range, Text};
 use diesel::Connection;
 use lazy_static::lazy_static;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::env;
 use std::fmt::{self, Display};
@@ -147,11 +147,10 @@ trait ForeignKeyClauses {
     }
 
     /// Add `ids`  as a bind variable to `out`, using the right SQL type
-    fn bind_ids<S: AsRef<str> + diesel::serialize::ToSql<Text, Pg>>(
-        &self,
-        ids: &[S],
-        out: &mut AstPass<Pg>,
-    ) -> QueryResult<()> {
+    fn bind_ids<S>(&self, ids: &[S], out: &mut AstPass<Pg>) -> QueryResult<()>
+    where
+        S: AsRef<str> + diesel::serialize::ToSql<Text, Pg>,
+    {
         match self.column_type().id_type() {
             IdType::String => out.push_bind_param::<Array<Text>, _>(&ids)?,
             IdType::Bytes => {
@@ -181,7 +180,10 @@ trait ForeignKeyClauses {
     /// Generate a clause
     ///    `exists (select 1 from unnest($ids) as p(g$id) where id = p.g$id)`
     /// using the right types to bind `$ids` into `out`
-    fn is_in(&self, ids: &Vec<&str>, out: &mut AstPass<Pg>) -> QueryResult<()> {
+    fn is_in<S>(&self, ids: &[S], out: &mut AstPass<Pg>) -> QueryResult<()>
+    where
+        S: AsRef<str> + diesel::serialize::ToSql<Text, Pg>,
+    {
         out.push_sql("exists (select 1 from unnest(");
         self.bind_ids(ids, out)?;
         out.push_sql(") as p(g$id) where id = p.g$id)");
@@ -1230,52 +1232,69 @@ impl<'a> LoadQuery<PgConnection, EntityData> for FindManyQuery<'a> {
 
 impl<'a, Conn> RunQueryDsl<Conn> for FindManyQuery<'a> {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InsertQuery<'a> {
     table: &'a Table,
-    key: &'a EntityKey,
-    entity: Entity,
+    entities: &'a Vec<(EntityKey, Entity)>,
+    unique_columns: Vec<&'a Column>,
     block: BlockNumber,
 }
 
 impl<'a> InsertQuery<'a> {
     pub fn new(
         table: &'a Table,
-        key: &'a EntityKey,
-        entity: Entity,
+        entities: &'a mut Vec<(EntityKey, Entity)>,
         block: BlockNumber,
     ) -> Result<InsertQuery<'a>, StoreError> {
-        let mut entity = entity;
-        for column in table.columns.iter() {
-            match column.fulltext_fields.as_ref() {
-                Some(fields) => {
-                    let fulltext_field_values = fields
-                        .iter()
-                        .filter_map(|field| entity.get(field))
-                        .cloned()
-                        .collect::<Vec<Value>>();
-                    if !fulltext_field_values.is_empty() {
-                        entity.insert(column.field.to_string(), Value::List(fulltext_field_values));
+        for (entity_key, entity) in entities.iter_mut() {
+            for column in table.columns.iter() {
+                match column.fulltext_fields.as_ref() {
+                    Some(fields) => {
+                        let fulltext_field_values = fields
+                            .iter()
+                            .filter_map(|field| entity.get(field))
+                            .cloned()
+                            .collect::<Vec<Value>>();
+                        if !fulltext_field_values.is_empty() {
+                            entity.insert(
+                                column.field.to_string(),
+                                Value::List(fulltext_field_values),
+                            );
+                        }
                     }
+                    None => (),
                 }
-                None => (),
-            }
-            if !column.is_nullable() && !entity.contains_key(&column.field) {
-                return Err(StoreError::QueryExecutionError(format!(
+                if !column.is_nullable() && !entity.contains_key(&column.field) {
+                    return Err(StoreError::QueryExecutionError(format!(
                     "can not insert entity {}[{}] since value for non-nullable attribute {} is missing. \
                      To fix this, mark the attribute as nullable in the GraphQL schema or change the \
                      mapping code to always set this attribute.",
-                    key.entity_type, key.entity_id, column.field
+                    entity_key.entity_type, entity_key.entity_id, column.field
                 )));
+                }
             }
         }
+        let unique_columns = InsertQuery::unique_columns(table, entities);
 
         Ok(InsertQuery {
             table,
-            key,
-            entity,
+            entities,
+            unique_columns,
             block,
         })
+    }
+
+    /// Build the column name list using the subset of all keys among present entities.
+    fn unique_columns(table: &'a Table, entities: &'a Vec<(EntityKey, Entity)>) -> Vec<&'a Column> {
+        let mut hashmap = HashMap::new();
+        for (_key, entity) in entities.iter() {
+            for column in &table.columns {
+                if entity.get(&column.field).is_some() {
+                    hashmap.entry(column.name.as_str()).or_insert(column);
+                }
+            }
+        }
+        hashmap.into_iter().map(|(_key, value)| value).collect()
     }
 }
 
@@ -1285,30 +1304,53 @@ impl<'a> QueryFragment<Pg> for InsertQuery<'a> {
 
         // Construct a query
         //   insert into schema.table(column, ...)
-        //   values ($1, ...)
+        //   values
+        //   (a, b, c),
+        //   (d, e, f)
+        //   [...]
+        //   (x, y, z)
+        //
         // and convert and bind the entity's values into it
         out.push_sql("insert into ");
         out.push_sql(self.table.qualified_name.as_str());
 
         out.push_sql("(");
-        for column in self.table.columns.iter() {
-            if self.entity.contains_key(&column.field) {
-                out.push_identifier(column.name.as_str())?;
-                out.push_sql(", ");
-            }
+
+        for &column in &self.unique_columns {
+            out.push_identifier(column.name.as_str())?;
+            out.push_sql(", ");
         }
         out.push_identifier(BLOCK_RANGE_COLUMN)?;
 
-        out.push_sql(")\nvalues(");
-        for column in self.table.columns.iter() {
-            if let Some(value) = self.entity.get(&column.field) {
-                QueryValue(value, &column.column_type).walk_ast(out.reborrow())?;
+        out.push_sql(") values\n");
+
+        // Use a `Peekable` iterator to help us decide how to finalize each line.
+        let mut iter = self.entities.iter().map(|(_key, entity)| entity).peekable();
+        while let Some(entity) = iter.next() {
+            out.push_sql("(");
+            for column in &self.unique_columns {
+                // If the column name is not within this entity's fields, we will issue the
+                // null value in its place
+                if let Some(value) = entity.get(&column.field) {
+                    QueryValue(value, &column.column_type).walk_ast(out.reborrow())?;
+                } else {
+                    out.push_sql("null");
+                }
                 out.push_sql(", ");
             }
+            let block_range: BlockRange = (self.block..).into();
+            out.push_bind_param::<Range<Integer>, _>(&block_range)?;
+            out.push_sql(")");
+
+            // finalize line according to remaining entities to insert
+            if iter.peek().is_some() {
+                out.push_sql(",\n");
+            }
         }
-        let block_range: BlockRange = (self.block..).into();
-        out.push_bind_param::<Range<Integer>, _>(&block_range)?;
-        out.push_sql(")");
+        out.push_sql("\nreturning ");
+        out.push_sql(PRIMARY_KEY_COLUMN);
+        out.push_sql("::text");
+
         Ok(())
     }
 }
@@ -1317,6 +1359,13 @@ impl<'a> QueryId for InsertQuery<'a> {
     type QueryId = ();
 
     const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for InsertQuery<'a> {
+    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
+        conn.query_by_name(&self)
+            .map(|data| ReturnedEntityData::bytes_as_str(&self.table, data))
+    }
 }
 
 impl<'a, Conn> RunQueryDsl<Conn> for InsertQuery<'a> {}
@@ -2463,17 +2512,21 @@ impl<'a, Conn> RunQueryDsl<Conn> for FilterQuery<'a> {}
 /// Reduce the upper bound of the current entry's block range to `block` as
 /// long as that does not result in an empty block range
 #[derive(Debug, Clone, Constructor)]
-pub struct ClampRangeQuery<'a> {
+pub struct ClampRangeQuery<'a, S> {
     table: &'a Table,
-    key: &'a EntityKey,
+    entity_type: &'a EntityType,
+    entity_ids: &'a [S],
     block: BlockNumber,
 }
 
-impl<'a> QueryFragment<Pg> for ClampRangeQuery<'a> {
+impl<'a, S> QueryFragment<Pg> for ClampRangeQuery<'a, S>
+where
+    S: AsRef<str> + diesel::serialize::ToSql<Text, Pg>,
+{
     fn walk_ast(&self, mut out: AstPass<Pg>) -> QueryResult<()> {
         // update table
         //    set block_range = int4range(lower(block_range), $block)
-        //  where id = $id
+        //  where id in (id1, id2, ..., idN)
         //    and block_range @> INTMAX
         out.unsafe_to_cache_prepared();
         out.push_sql("update ");
@@ -2485,34 +2538,39 @@ impl<'a> QueryFragment<Pg> for ClampRangeQuery<'a> {
         out.push_sql("), ");
         out.push_bind_param::<Integer, _>(&self.block)?;
         out.push_sql(")\n where ");
-        self.table.primary_key().eq(&self.key.entity_id, &mut out)?;
+
+        self.table.primary_key().is_in(self.entity_ids, &mut out)?;
         out.push_sql(" and (");
         out.push_sql(BLOCK_RANGE_CURRENT);
         out.push_sql(")");
+
         Ok(())
     }
 }
 
-impl<'a> QueryId for ClampRangeQuery<'a> {
+impl<'a, S> QueryId for ClampRangeQuery<'a, S>
+where
+    S: AsRef<str> + diesel::serialize::ToSql<Text, Pg>,
+{
     type QueryId = ();
 
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
-impl<'a, Conn> RunQueryDsl<Conn> for ClampRangeQuery<'a> {}
+impl<'a, S, Conn> RunQueryDsl<Conn> for ClampRangeQuery<'a, S> {}
 
 /// Helper struct for returning the id's touched by the RevertRemove and
 /// RevertExtend queries
 #[derive(QueryableByName, PartialEq, Eq, Hash)]
-pub struct RevertEntityData {
+pub struct ReturnedEntityData {
     #[sql_type = "Text"]
     pub id: String,
 }
 
-impl RevertEntityData {
+impl ReturnedEntityData {
     /// Convert primary key ids from Postgres' internal form to the format we
     /// use by stripping `\\x` off the front of bytes strings
-    fn bytes_as_str(table: &Table, mut data: Vec<RevertEntityData>) -> Vec<RevertEntityData> {
+    fn bytes_as_str(table: &Table, mut data: Vec<ReturnedEntityData>) -> Vec<ReturnedEntityData> {
         match table.primary_key().column_type.id_type() {
             IdType::String => data,
             IdType::Bytes => {
@@ -2560,10 +2618,10 @@ impl<'a> QueryId for RevertRemoveQuery<'a> {
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
-impl<'a> LoadQuery<PgConnection, RevertEntityData> for RevertRemoveQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<RevertEntityData>> {
+impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for RevertRemoveQuery<'a> {
+    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
         conn.query_by_name(&self)
-            .map(|data| RevertEntityData::bytes_as_str(&self.table, data))
+            .map(|data| ReturnedEntityData::bytes_as_str(&self.table, data))
     }
 }
 
@@ -2631,10 +2689,10 @@ impl<'a> QueryId for RevertClampQuery<'a> {
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
-impl<'a> LoadQuery<PgConnection, RevertEntityData> for RevertClampQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<RevertEntityData>> {
+impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for RevertClampQuery<'a> {
+    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
         conn.query_by_name(&self)
-            .map(|data| RevertEntityData::bytes_as_str(&self.table, data))
+            .map(|data| ReturnedEntityData::bytes_as_str(&self.table, data))
     }
 }
 
@@ -2687,10 +2745,10 @@ impl<'a> QueryId for DeleteByPrefixQuery<'a> {
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
-impl<'a> LoadQuery<PgConnection, RevertEntityData> for DeleteByPrefixQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<RevertEntityData>> {
+impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for DeleteByPrefixQuery<'a> {
+    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
         conn.query_by_name(&self)
-            .map(|data| RevertEntityData::bytes_as_str(&self.table, data))
+            .map(|data| ReturnedEntityData::bytes_as_str(&self.table, data))
     }
 }
 

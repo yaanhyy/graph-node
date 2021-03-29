@@ -6,9 +6,9 @@
 //!
 //! The pivotal struct in this module is the `Layout` which handles all the
 //! information about mapping a GraphQL schema to database tables
-use diesel::connection::SimpleConnection;
+use diesel::{connection::SimpleConnection, Connection};
 use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
-use graph::prelude::{q, s};
+use graph::prelude::{q, s, StopwatchMetrics};
 use inflector::Inflector;
 use lazy_static::lazy_static;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -63,6 +63,20 @@ lazy_static! {
             .ok()
             .map(|v| v.split(",").map(|s| s.to_owned()).collect())
             .unwrap_or(HashSet::new())
+    };
+
+    /// `GRAPH_SQL_STATEMENT_TIMEOUT` is the timeout for queries in seconds.
+    /// If it is not set, no statement timeout will be enforced. The statement
+    /// timeout is local, i.e., can only be used within a transaction and
+    /// will be cleared at the end of the transaction
+    static ref STATEMENT_TIMEOUT: Option<String> = {
+        env::var("GRAPH_SQL_STATEMENT_TIMEOUT")
+        .ok()
+        .map(|s| {
+            u64::from_str(&s).unwrap_or_else(|_| {
+                panic!("GRAPH_SQL_STATEMENT_TIMEOUT must be a number, but is `{}`", s)
+            })
+        }).map(|timeout| format!("set local statement_timeout={}", timeout * 1000))
     };
 }
 
@@ -546,14 +560,16 @@ impl Layout {
     pub fn insert(
         &self,
         conn: &PgConnection,
-        key: &EntityKey,
-        entity: Entity,
+        entity_type: &EntityType,
+        entities: &mut Vec<(EntityKey, Entity)>,
         block: BlockNumber,
-    ) -> Result<(), StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        let query = InsertQuery::new(table, key, entity, block)?;
-        query.execute(conn)?;
-        Ok(())
+        stopwatch: &StopwatchMetrics,
+    ) -> Result<usize, StoreError> {
+        let table = self.table_for_entity(entity_type)?;
+        let _section = stopwatch.start_section("insert_modification_insert_query");
+        Ok(InsertQuery::new(table, entities, block)?
+            .get_results(conn)
+            .map(|ids| ids.len())?)
     }
 
     pub fn conflicting_entity(
@@ -622,13 +638,20 @@ impl Layout {
         let query_clone = query.clone();
 
         let start = Instant::now();
-        let values = query.load::<EntityData>(conn).map_err(|e| {
-            QueryExecutionError::ResolveEntitiesError(format!(
-                "{}, query = {:?}",
-                e,
-                debug_query(&query_clone).to_string()
-            ))
-        })?;
+        let values = conn
+            .transaction(|| {
+                if let Some(ref timeout_sql) = *STATEMENT_TIMEOUT {
+                    conn.batch_execute(timeout_sql)?;
+                }
+                query.load::<EntityData>(conn)
+            })
+            .map_err(|e| {
+                QueryExecutionError::ResolveEntitiesError(format!(
+                    "{}, query = {:?}",
+                    e,
+                    debug_query(&query_clone).to_string()
+                ))
+            })?;
         log_query_timing(logger, &query_clone, start.elapsed(), values.len());
         values
             .into_iter()
@@ -643,25 +666,34 @@ impl Layout {
     pub fn update(
         &self,
         conn: &PgConnection,
-        key: &EntityKey,
-        entity: Entity,
+        entity_type: EntityType,
+        mut entities: Vec<(EntityKey, Entity)>,
         block: BlockNumber,
-    ) -> Result<(), StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        ClampRangeQuery::new(table, key, block).execute(conn)?;
-        let query = InsertQuery::new(table, key, entity, block)?;
-        query.execute(conn)?;
-        Ok(())
+        stopwatch: &StopwatchMetrics,
+    ) -> Result<usize, StoreError> {
+        let table = self.table_for_entity(&entity_type)?;
+        let entity_keys: Vec<&str> = entities
+            .iter()
+            .map(|(key, _)| key.entity_id.as_str())
+            .collect();
+        let section = stopwatch.start_section("update_modification_clamp_range_query");
+        ClampRangeQuery::new(table, &entity_type, &entity_keys, block).execute(conn)?;
+        section.end();
+        let _section = stopwatch.start_section("update_modification_insert_query");
+        Ok(InsertQuery::new(table, &mut entities, block)?.execute(conn)?)
     }
 
     pub fn delete(
         &self,
         conn: &PgConnection,
-        key: &EntityKey,
+        entity_type: &EntityType,
+        entity_ids: &Vec<String>,
         block: BlockNumber,
+        stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        Ok(ClampRangeQuery::new(table, key, block).execute(conn)?)
+        let table = self.table_for_entity(&entity_type)?;
+        let _section = stopwatch.start_section("delete_modification_clamp_range_query");
+        Ok(ClampRangeQuery::new(table, &entity_type, entity_ids, block).execute(conn)?)
     }
 
     pub fn revert_block(

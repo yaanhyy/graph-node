@@ -1,10 +1,18 @@
-use diesel::pg::PgConnection;
-use diesel::r2d2::{self, event as e, ConnectionManager, HandleEvent, Pool, PooledConnection};
+use diesel::{connection::SimpleConnection, pg::PgConnection, sql_query, RunQueryDsl};
+use diesel::{
+    r2d2::{self, event as e, ConnectionManager, HandleEvent, Pool, PooledConnection},
+    Connection,
+};
 
-use graph::prelude::{
-    error, info, o, tokio::sync::Semaphore, CancelGuard, CancelHandle, CancelToken as _,
-    CancelableError, Counter, Gauge, Logger, MetricsRegistry, MovingStats, PoolWaitStats,
-    StoreError,
+use graph::{
+    prelude::{
+        anyhow::{self, anyhow, bail},
+        debug, error, info, o,
+        tokio::sync::Semaphore,
+        CancelGuard, CancelHandle, CancelToken as _, CancelableError, Counter, Gauge, Logger,
+        MetricsRegistry, MovingStats, PoolWaitStats, StoreError,
+    },
+    util::security::SafeDisplay,
 };
 
 use std::fmt;
@@ -12,10 +20,149 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, sync::RwLock};
 
+use postgres::config::{Config, Host};
+
+use crate::{Shard, PRIMARY_SHARD};
+
+pub struct ForeignServer {
+    pub name: String,
+    pub shard: Shard,
+    pub user: String,
+    pub password: String,
+    pub host: String,
+    pub port: u16,
+    pub dbname: String,
+}
+
+impl ForeignServer {
+    const PRIMARY_PUBLIC: &'static str = "primary_public";
+
+    fn name(shard: &Shard) -> String {
+        format!("shard_{}", shard.as_str())
+    }
+
+    fn new(shard: Shard, postgres_url: &str) -> Result<Self, anyhow::Error> {
+        let config: Config = match postgres_url.parse() {
+            Ok(config) => config,
+            Err(e) => panic!(
+                "failed to parse Postgres connection string `{}`: {}",
+                SafeDisplay(postgres_url),
+                e
+            ),
+        };
+
+        let host = match config.get_hosts().get(0) {
+            Some(Host::Tcp(host)) => host.to_string(),
+            _ => bail!("can not find host name in `{}`", SafeDisplay(postgres_url)),
+        };
+
+        let user = config
+            .get_user()
+            .ok_or_else(|| anyhow!("could not find user in `{}`", SafeDisplay(postgres_url)))?
+            .to_string();
+        let password = String::from_utf8(
+            config
+                .get_password()
+                .ok_or_else(|| anyhow!("could not find user in `{}`", SafeDisplay(postgres_url)))?
+                .into(),
+        )?;
+        let port = config.get_ports().get(0).cloned().unwrap_or(5432u16);
+        let dbname = config
+            .get_dbname()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("could not find user in `{}`", SafeDisplay(postgres_url)))?;
+
+        Ok(Self {
+            name: Self::name(&shard),
+            shard,
+            user,
+            password,
+            host,
+            port,
+            dbname,
+        })
+    }
+
+    /// Create a new foreign server and user mapping on `conn` for this foreign
+    /// server
+    fn create(&self, conn: &PgConnection) -> Result<(), StoreError> {
+        let query = format!(
+            "\
+        create server \"{name}\"
+               foreign data wrapper postgres_fdw
+               options (host '{remote_host}', dbname '{remote_db}', updatable 'false');
+        create user mapping
+               for current_user server \"{name}\"
+               options (user '{remote_user}', password '{remote_password}');",
+            name = self.name,
+            remote_host = self.host,
+            remote_db = self.dbname,
+            remote_user = self.user,
+            remote_password = self.password,
+        );
+        Ok(conn.batch_execute(&query)?)
+    }
+
+    /// Update an existing user mapping with possibly new details
+    fn update(&self, conn: &PgConnection) -> Result<(), StoreError> {
+        let query = format!(
+            "\
+        alter server \"{name}\"
+              options (set host '{remote_host}', set dbname '{remote_db}');
+        alter user mapping
+              for current_user server \"{name}\"
+              options (set user '{remote_user}', set password '{remote_password}');",
+            name = self.name,
+            remote_host = self.host,
+            remote_db = self.dbname,
+            remote_user = self.user,
+            remote_password = self.password,
+        );
+        Ok(conn.batch_execute(&query)?)
+    }
+
+    /// Map key tables from the primary into our local schema. If we are the
+    /// primary, set them up as views.
+    ///
+    /// We recreate this mapping on every server start so that migrations that
+    /// change one of the mapped tables actually show up in the imported tables
+    fn map_primary(conn: &PgConnection, shard: &Shard) -> Result<(), StoreError> {
+        let query = format!(
+            "drop schema if exists {nsp} cascade;
+            create schema {nsp};",
+            nsp = Self::PRIMARY_PUBLIC
+        );
+        conn.batch_execute(&query)?;
+
+        let query = if shard == &*PRIMARY_SHARD {
+            format!(
+                "create view {nsp}.deployment_schemas as
+                        select * from public.deployment_schemas;
+                 create view {nsp}.chains as
+                        select * from public.chains",
+                nsp = Self::PRIMARY_PUBLIC
+            )
+        } else {
+            format!(
+                "import foreign schema public
+                        limit to (deployment_schemas, chains) \
+                        from server {shard} into {nsp};",
+                shard = Self::name(&*PRIMARY_SHARD),
+                nsp = Self::PRIMARY_PUBLIC
+            )
+        };
+        conn.batch_execute(&query)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectionPool {
+    logger: Logger,
+    shard: Shard,
     pool: Pool<ConnectionManager<PgConnection>>,
     limiter: Arc<Semaphore>,
+    postgres_url: String,
     pub(crate) wait_stats: PoolWaitStats,
 }
 
@@ -124,7 +271,7 @@ impl ConnectionPool {
         registry: Arc<dyn MetricsRegistry>,
     ) -> ConnectionPool {
         let logger_store = logger.new(o!("component" => "Store"));
-        let logger_pool = logger.new(o!("component" => "PostgresConnectionPool"));
+        let logger_pool = logger.new(o!("component" => "ConnectionPool"));
         let const_labels = {
             let mut map = HashMap::new();
             map.insert("pool".to_owned(), pool_name.to_owned());
@@ -172,6 +319,10 @@ impl ConnectionPool {
         let limiter = Arc::new(Semaphore::new(pool_size as usize));
         info!(logger_store, "Pool successfully connected to Postgres");
         ConnectionPool {
+            logger: logger_pool,
+            shard: Shard::new(shard_name.to_string())
+                .expect("shard_name is a valid name for a shard"),
+            postgres_url: postgres_url.clone(),
             pool,
             limiter,
             wait_stats,
@@ -279,4 +430,118 @@ impl ConnectionPool {
             }
         }
     }
+
+    pub fn connection_detail(&self) -> Result<ForeignServer, StoreError> {
+        ForeignServer::new(self.shard.clone(), &self.postgres_url).map_err(|e| e.into())
+    }
+
+    /// Setup the database for this pool. This includes configuring foreign
+    /// data wrappers for cross-shard communication, and running any pending
+    /// schema migrations for this database.
+    ///
+    /// # Panics
+    ///
+    /// If any errors happen during the migration, the process panics
+    pub async fn setup(&self, servers: Arc<Vec<ForeignServer>>) {
+        #[derive(QueryableByName)]
+        struct LockResult {
+            #[sql_type = "diesel::sql_types::Bool"]
+            migrate: bool,
+        }
+
+        let pool = self.clone();
+        self.with_conn(move |conn, _| {
+            // Get an advisory session-level lock. The graph-node process
+            // that acquires the lock will run the migration. Everybody else
+            // will skip running migrations.
+            //
+            // We use two locks: one so we can tell whether we were the
+            // lucky ones that should run the migration, and one that blocks
+            // every process that is not running migrations until the
+            // migration is finished
+            let lock = sql_query("select pg_try_advisory_lock(1) as migrate, pg_advisory_lock(2)")
+                .get_result::<LockResult>(conn)
+                .expect("we can try to get advisory locks 1 and 2");
+            let result = if lock.migrate {
+                pool.configure_fdw(servers)
+                    .and_then(|_| migrate_schema(&pool.logger, conn))
+                    .and_then(|_| pool.map_primary())
+            } else {
+                Ok(())
+            };
+            sql_query("select pg_advisory_unlock(1), pg_advisory_unlock(2)")
+                .execute(conn)
+                .expect("we can unlock the advisory locks");
+            result.expect("migration succeeds");
+            Ok(())
+        })
+        .await
+        .expect("migrations are never canceled");
+    }
+
+    fn configure_fdw(&self, servers: Arc<Vec<ForeignServer>>) -> Result<(), StoreError> {
+        let conn = self.get()?;
+        conn.transaction(|| {
+            let current_servers: Vec<String> = crate::catalog::current_servers(&conn)?;
+            for server in servers.iter().filter(|server| server.shard != self.shard) {
+                if current_servers.contains(&server.name) {
+                    server.update(&conn)?;
+                } else {
+                    server.create(&conn)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Map key tables from the primary into our local schema. If we are the
+    /// primary, set them up as views.
+    ///
+    /// We recreate this mapping on every server start so that migrations that
+    /// change one of the mapped tables actually show up in the imported tables
+    fn map_primary(&self) -> Result<(), StoreError> {
+        let conn = self.get()?;
+        conn.transaction(|| ForeignServer::map_primary(&conn, &self.shard))
+    }
+}
+
+embed_migrations!("./migrations");
+
+/// Run all schema migrations.
+///
+/// When multiple `graph-node` processes start up at the same time, we ensure
+/// that they do not run migrations in parallel by using `blocking_conn` to
+/// serialize them. The `conn` is used to run the actual migration.
+fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<(), StoreError> {
+    // Collect migration logging output
+    let mut output = vec![];
+
+    info!(
+        logger,
+        "Waiting for other graph-node instances to finish migrating"
+    );
+    let result = embedded_migrations::run_with_output(conn, &mut output);
+    info!(logger, "Migrations finished");
+
+    // If there was any migration output, log it now
+    let has_output = !output.is_empty();
+    if has_output {
+        let msg = String::from_utf8(output).unwrap_or_else(|_| String::from("<unreadable>"));
+        if let Err(e) = result {
+            error!(logger, "Postgres migration output"; "output" => msg);
+            return Err(StoreError::Unknown(e.into()));
+        } else {
+            debug!(logger, "Postgres migration output"; "output" => msg);
+        }
+    }
+
+    if has_output {
+        // We take getting output as a signal that a migration was actually
+        // run, which is not easy to tell from the Diesel API, and reset the
+        // query statistics since a schema change makes them not all that
+        // useful. An error here is not serious and can be ignored.
+        conn.batch_execute("select pg_stat_statements_reset()").ok();
+    }
+
+    Ok(())
 }

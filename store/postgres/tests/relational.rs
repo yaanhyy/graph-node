@@ -1,14 +1,17 @@
 //! Test mapping of GraphQL schema to a relational schema
 use diesel::connection::SimpleConnection as _;
 use diesel::pg::PgConnection;
+use graph::prelude::{
+    o, slog, web3::types::H256, Entity, EntityCollection, EntityFilter, EntityKey, EntityOrder,
+    EntityQuery, EntityRange, Logger, Schema, StopwatchMetrics, SubgraphDeploymentId, Value,
+    ValueType, BLOCK_NUMBER_MAX,
+};
+use graph_mock::MockMetricsRegistry;
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use graph::prelude::{
-    web3::types::H256, Entity, EntityCollection, EntityFilter, EntityKey, EntityOrder, EntityQuery,
-    EntityRange, Schema, SubgraphDeploymentId, Value, ValueType, BLOCK_NUMBER_MAX,
-};
 use graph::{
     components::store::EntityType,
     data::store::scalar::{BigDecimal, BigInt, Bytes},
@@ -172,6 +175,11 @@ lazy_static! {
     static ref SCALAR: EntityType = EntityType::from("Scalar");
     static ref NO_ENTITY: EntityType = EntityType::from("NoEntity");
     static ref NULLABLE_STRINGS: EntityType = EntityType::from("NullableStrings");
+    static ref MOCK_STOPWATCH: StopwatchMetrics = StopwatchMetrics::new(
+        Logger::root(slog::Discard, o!()),
+        THINGS_SUBGRAPH_ID.clone(),
+        Arc::new(MockMetricsRegistry::new()),
+    );
 }
 
 /// Removes test data from the database behind the store.
@@ -181,24 +189,74 @@ fn remove_test_data(conn: &PgConnection) {
         .expect("Failed to drop test schema");
 }
 
-fn insert_entity(conn: &PgConnection, layout: &Layout, entity_type: &str, entity: Entity) {
-    let key = EntityKey::data(
-        THINGS_SUBGRAPH_ID.clone(),
-        entity_type.to_owned(),
-        entity.id().unwrap(),
+fn insert_entity(
+    conn: &PgConnection,
+    layout: &Layout,
+    entity_type: &str,
+    mut entities: Vec<Entity>,
+) {
+    let mut entities_with_keys = entities
+        .drain(..)
+        .map(|entity| {
+            let key = EntityKey::data(
+                THINGS_SUBGRAPH_ID.clone(),
+                entity_type.to_owned(),
+                entity.id().unwrap(),
+            );
+            (key, entity)
+        })
+        .collect();
+    let entity_type = EntityType::from(entity_type);
+    let errmsg = format!(
+        "Failed to insert entities {}[{:?}]",
+        entity_type, entities_with_keys
     );
-    let errmsg = format!("Failed to insert entity {}[{}]", entity_type, key.entity_id);
-    layout.insert(&conn, &key, entity, 0).expect(&errmsg);
+    let inserted = layout
+        .insert(
+            &conn,
+            &entity_type,
+            &mut entities_with_keys,
+            0,
+            &MOCK_STOPWATCH,
+        )
+        .expect(&errmsg);
+    assert_eq!(inserted, entities_with_keys.len());
 }
 
-fn update_entity(conn: &PgConnection, layout: &Layout, entity_type: &str, entity: Entity) {
-    let key = EntityKey::data(
-        THINGS_SUBGRAPH_ID.clone(),
-        entity_type.to_owned(),
-        entity.id().unwrap(),
+fn update_entity(
+    conn: &PgConnection,
+    layout: &Layout,
+    entity_type: &str,
+    mut entities: Vec<Entity>,
+) {
+    let entities_with_keys: Vec<(EntityKey, Entity)> = entities
+        .drain(..)
+        .map(|entity| {
+            let key = EntityKey::data(
+                THINGS_SUBGRAPH_ID.clone(),
+                entity_type.to_owned(),
+                entity.id().unwrap(),
+            );
+            (key, entity)
+        })
+        .collect();
+
+    let entity_type = EntityType::from(entity_type);
+    let errmsg = format!(
+        "Failed to insert entities {}[{:?}]",
+        entity_type, entities_with_keys
     );
-    let errmsg = format!("Failed to update entity {}[{}]", entity_type, key.entity_id);
-    layout.update(&conn, &key, entity, 1).expect(&errmsg);
+
+    let updated = layout
+        .update(
+            &conn,
+            entity_type,
+            entities_with_keys.clone(),
+            0,
+            &MOCK_STOPWATCH,
+        )
+        .expect(&errmsg);
+    assert_eq!(updated, entities_with_keys.len());
 }
 
 fn insert_user_entity(
@@ -238,7 +296,7 @@ fn insert_user_entity(
         user.insert("drinks".to_owned(), drinks.into());
     }
 
-    insert_entity(conn, layout, entity_type, user);
+    insert_entity(conn, layout, entity_type, vec![user]);
 }
 
 fn insert_users(conn: &PgConnection, layout: &Layout) {
@@ -320,14 +378,14 @@ fn update_user_entity(
         user.insert("drinks".to_owned(), drinks.into());
     }
 
-    update_entity(conn, layout, entity_type, user);
+    update_entity(conn, layout, entity_type, vec![user]);
 }
 
 fn insert_pet(conn: &PgConnection, layout: &Layout, entity_type: &str, id: &str, name: &str) {
     let mut pet = Entity::new();
     pet.set("id", id);
     pet.set("name", name);
-    insert_entity(conn, layout, entity_type, pet);
+    insert_entity(conn, layout, entity_type, vec![pet]);
 }
 
 fn insert_pets(conn: &PgConnection, layout: &Layout) {
@@ -405,7 +463,7 @@ where
 #[test]
 fn find() {
     run_test(|conn, layout| {
-        insert_entity(&conn, &layout, "Scalar", SCALAR_ENTITY.clone());
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
 
         // Happy path: find existing entity
         let entity = layout
@@ -439,7 +497,7 @@ fn insert_null_fulltext_fields() {
             &conn,
             &layout,
             "NullableStrings",
-            EMPTY_NULLABLESTRINGS_ENTITY.clone(),
+            vec![EMPTY_NULLABLESTRINGS_ENTITY.clone()],
         );
 
         // Find entity with null string values
@@ -454,7 +512,7 @@ fn insert_null_fulltext_fields() {
 #[test]
 fn update() {
     run_test(|conn, layout| {
-        insert_entity(&conn, &layout, "Scalar", SCALAR_ENTITY.clone());
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
@@ -466,19 +524,118 @@ fn update() {
             "Scalar".to_owned(),
             entity.id().unwrap().clone(),
         );
+
+        let entity_type = EntityType::from("Scalar");
+        let mut entities = vec![(key, entity)];
         layout
-            .update(&conn, &key, entity.clone(), 1)
+            .update(&conn, entity_type, entities.clone(), 0, &MOCK_STOPWATCH)
             .expect("Failed to update");
 
         // The missing 'strings' will show up as Value::Null in the
         // loaded entity
-        entity.set("strings", Value::Null);
+        let entity_again = &mut entities.get_mut(0).unwrap().1;
+        entity_again.set("strings", Value::Null);
 
         let actual = layout
             .find(conn, &*SCALAR, "one", BLOCK_NUMBER_MAX)
             .expect("Failed to read Scalar[one]")
             .unwrap();
-        assert_entity_eq!(scrub(&entity), actual);
+        assert_entity_eq!(scrub(&entity_again), actual);
+    });
+}
+
+#[test]
+fn update_many() {
+    run_test(|conn, layout| {
+        let mut one = SCALAR_ENTITY.clone();
+        let mut two = SCALAR_ENTITY.clone();
+        two.set("id", "two");
+        let mut three = SCALAR_ENTITY.clone();
+        three.set("id", "three");
+        insert_entity(
+            &conn,
+            &layout,
+            "Scalar",
+            vec![one.clone(), two.clone(), three.clone()],
+        );
+
+        // confidence test: there should be 3 scalar entities in store right now
+        assert_eq!(3, count_scalar_entities(conn, layout));
+
+        // update with overwrite
+        one.set("string", "updated");
+        one.remove("strings");
+
+        two.set("string", "updated too");
+        two.set("bool", false);
+
+        three.set("string", "updated in a different way");
+        three.remove("strings");
+        three.set("color", "red");
+
+        // generate keys
+        let entity_type = EntityType::from("Scalar");
+        let keys: Vec<EntityKey> = ["one", "two", "three"]
+            .iter()
+            .map(|id| {
+                EntityKey::data(
+                    THINGS_SUBGRAPH_ID.clone(),
+                    "Scalar".to_owned(),
+                    String::from(*id),
+                )
+            })
+            .collect();
+
+        let entities = keys
+            .into_iter()
+            .zip(vec![one, two, three].into_iter())
+            .collect();
+
+        layout
+            .update(&conn, entity_type, entities, 0, &MOCK_STOPWATCH)
+            .expect("Failed to update");
+
+        // check updates took effect
+        let updated: Vec<Entity> = ["one", "two", "three"]
+            .iter()
+            .map(|id| {
+                layout
+                    .find(conn, &*SCALAR, id, BLOCK_NUMBER_MAX)
+                    .expect(&format!("Failed to read Scalar[{}]", id))
+                    .unwrap()
+            })
+            .collect();
+        let new_one = &updated[0];
+        let new_two = &updated[1];
+        let new_three = &updated[2];
+
+        // check they have the same id
+        assert_eq!(new_one.get("id"), Some(&Value::String("one".to_string())));
+        assert_eq!(new_two.get("id"), Some(&Value::String("two".to_string())));
+        assert_eq!(
+            new_three.get("id"),
+            Some(&Value::String("three".to_string()))
+        );
+
+        // check their fields got updated as expected
+        assert_eq!(
+            new_one.get("string"),
+            Some(&Value::String("updated".to_string()))
+        );
+        assert_eq!(new_one.get("strings"), None);
+        assert_eq!(
+            new_two.get("string"),
+            Some(&Value::String("updated too".to_string()))
+        );
+        assert_eq!(new_two.get("bool"), Some(&Value::Bool(false)));
+        assert_eq!(
+            new_three.get("string"),
+            Some(&Value::String("updated in a different way".to_string()))
+        );
+        assert_eq!(
+            new_three.get("color"),
+            Some(&Value::String("red".to_string()))
+        );
     });
 }
 
@@ -486,7 +643,7 @@ fn update() {
 #[test]
 fn serialize_bigdecimal() {
     run_test(|conn, layout| {
-        insert_entity(&conn, &layout, "Scalar", SCALAR_ENTITY.clone());
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
@@ -500,8 +657,10 @@ fn serialize_bigdecimal() {
                 "Scalar".to_owned(),
                 entity.id().unwrap().clone(),
             );
+            let entity_type = EntityType::from("Scalar");
+            let entities = vec![(key, entity.clone())];
             layout
-                .update(&conn, &key, entity.clone(), 1)
+                .update(&conn, entity_type, entities, 0, &MOCK_STOPWATCH)
                 .expect("Failed to update");
 
             let actual = layout
@@ -540,25 +699,65 @@ fn count_scalar_entities(conn: &PgConnection, layout: &Layout) -> usize {
 #[test]
 fn delete() {
     run_test(|conn, layout| {
-        insert_entity(&conn, &layout, "Scalar", SCALAR_ENTITY.clone());
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
         let mut two = SCALAR_ENTITY.clone();
         two.set("id", "two");
-        insert_entity(&conn, &layout, "Scalar", two);
+        insert_entity(&conn, &layout, "Scalar", vec![two]);
 
         // Delete where nothing is getting deleted
-        let mut key = EntityKey::data(
+        let key = EntityKey::data(
             THINGS_SUBGRAPH_ID.clone(),
             "Scalar".to_owned(),
             "no such entity".to_owned(),
         );
-        let count = layout.delete(&conn, &key, 1).expect("Failed to delete");
+        let entity_type = EntityType::from("Scalar");
+        let mut entity_keys = vec![key.entity_id];
+        let count = layout
+            .delete(
+                &conn,
+                &entity_type.clone(),
+                &entity_keys,
+                1,
+                &MOCK_STOPWATCH,
+            )
+            .expect("Failed to delete");
         assert_eq!(0, count);
         assert_eq!(2, count_scalar_entities(conn, layout));
 
         // Delete entity two
-        key.entity_id = "two".to_owned();
-        let count = layout.delete(&conn, &key, 1).expect("Failed to delete");
+        entity_keys
+            .get_mut(0)
+            .map(|key| *key = "two".to_owned())
+            .expect("Failed to update key");
+
+        let count = layout
+            .delete(&conn, &entity_type, &entity_keys, 1, &MOCK_STOPWATCH)
+            .expect("Failed to delete");
         assert_eq!(1, count);
+        assert_eq!(1, count_scalar_entities(conn, layout));
+    });
+}
+
+#[test]
+fn insert_many_and_delete_many() {
+    run_test(|conn, layout| {
+        let one = SCALAR_ENTITY.clone();
+        let mut two = SCALAR_ENTITY.clone();
+        two.set("id", "two");
+        let mut three = SCALAR_ENTITY.clone();
+        three.set("id", "three");
+        insert_entity(&conn, &layout, "Scalar", vec![one, two, three]);
+
+        // confidence test: there should be 3 scalar entities in store right now
+        assert_eq!(3, count_scalar_entities(conn, layout));
+
+        // Delete entities with ids equal to "two" and "three"
+        let entity_type = EntityType::from("Scalar");
+        let entity_keys = vec!["two".to_string(), "three".to_string()];
+        let num_removed = layout
+            .delete(&conn, &entity_type, &entity_keys, 1, &MOCK_STOPWATCH)
+            .expect("Failed to delete");
+        assert_eq!(2, num_removed);
         assert_eq!(1, count_scalar_entities(conn, layout));
     });
 }
@@ -574,7 +773,7 @@ fn conflicting_entity() {
         let mut fred = Entity::new();
         fred.set("id", id);
         fred.set("name", id);
-        insert_entity(&conn, &layout, "Cat", fred);
+        insert_entity(&conn, &layout, "Cat", vec![fred]);
 
         // If we wanted to create Fred the dog, which is forbidden, we'd run this:
         let conflict = layout

@@ -39,5 +39,5 @@ pub fn main() {
         "Failed to convert to API schema",
     );
 
-    println!("{}", schema);
+    println!("schame:{}", schema);
 }

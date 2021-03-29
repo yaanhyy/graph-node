@@ -4,9 +4,9 @@ version = "0.22.0"
 edition = "2018"
 
 [dependencies]
-async-trait = "0.1.41"
+async-trait = "0.1.48"
 blake3 = "0.3.7"
-derive_more = { version = "0.99.11" }
+derive_more = { version = "0.99.13" }
 diesel = { version = "1.4.6", features = ["postgres", "serde_json", "numeric", "r2d2"] }
 # We use diesel-dynamic-schema straight from git as the project has not
 # made a release as a crate yet
@@ -23,7 +23,7 @@ Inflector = "0.11.3"
 lazy_static = "1.1"
 lru_time_cache = "0.11"
 maybe-owned = "0.3.4"
-postgres = "0.15.2"
+postgres = "0.19.0"
 rand = "0.6.1"
 serde = "1.0"
 uuid = { version = "0.8.1", features = ["v4"] }
